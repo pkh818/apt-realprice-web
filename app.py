@@ -2,11 +2,10 @@ import re
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from difflib import SequenceMatcher
 
 import pandas as pd
-import requests
 import streamlit as st
 import plotly.graph_objects as go
 
@@ -14,7 +13,7 @@ import plotly.graph_objects as go
 # 페이지 기본 설정
 # =====================================================================
 st.set_page_config(
-    page_title="국토부 실거래가 & 매물 호가 통합 대시보드",
+    page_title="국토부 실거래가 & 네이버 호가 통합 대시보드",
     page_icon="🏢",
     layout="wide",
 )
@@ -24,77 +23,117 @@ DEFAULT_API_KEY = st.secrets.get(
     "31a08f319d25f742296a53f8cf22e82830a5aae5efd82cd666d17b62e2f9e64b",
 )
 
-# 전국 시/도 기본 코드 매핑 (외부 서버 장애 시에도 즉시 선택 가능)
-SIDO_CODE_MAP = {
-    "서울특별시": "11",
-    "부산광역시": "26",
-    "대구광역시": "27",
-    "인천광역시": "28",
-    "광주광역시": "29",
-    "대전광역시": "30",
-    "울산광역시": "31",
-    "세종특별자치시": "36",
-    "경기도": "41",
-    "강원특별자치도": "51",
-    "충청북도": "43",
-    "충청남도": "44",
-    "전북특별자치도": "52",
-    "전라남도": "46",
-    "경상북도": "47",
-    "경상남도": "48",
-    "제주특별자치도": "50",
+# =====================================================================
+# 전국 시/도 및 시/군/구 법정동 5자리 코드 내장 데이터 (외부 API 장애 원천 차단)
+# =====================================================================
+REGION_DATA = {
+    "서울특별시": {
+        "강남구": "11680", "강동구": "11740", "강북구": "11305", "강서구": "11500",
+        "관악구": "11620", "광진구": "11215", "구로구": "11530", "금천구": "11545",
+        "노원구": "11350", "도봉구": "11320", "동대문구": "11230", "동작구": "11590",
+        "마포구": "11440", "서대문구": "11410", "서초구": "11650", "성동구": "11200",
+        "성북구": "11290", "송파구": "11710", "양천구": "11470", "영등포구": "11560",
+        "용산구": "11170", "은평구": "11380", "종로구": "11110", "중구": "11140", "중랑구": "11260",
+    },
+    "경기도": {
+        "가평군": "41820", "고양시 덕양구": "41281", "고양시 일산동구": "41285", "고양시 일산서구": "41287",
+        "과천시": "41290", "광명시": "41210", "광주시": "41610", "구리시": "41310",
+        "군포시": "41410", "김포시": "41570", "남양주시": "41360", "동두천시": "41250",
+        "부천시 소사구": "41194", "부천시 오정구": "41196", "부천시 원미구": "41192",
+        "성남시 분당구": "41135", "성남시 수정구": "41131", "성남시 중원구": "41133",
+        "수원시 권선구": "41113", "수원시 영통구": "41117", "수원시 장안구": "41111", "수원시 팔달구": "41115",
+        "시흥시": "41390", "안산시 단원구": "41273", "안산시 상록구": "41271", "안성시": "41550",
+        "안양시 동안구": "41173", "안양시 만안구": "41171", "양주시": "41630", "양평군": "41830",
+        "여주시": "41670", "연천군": "41800", "오산시": "41370",
+        "용인시 기흥구": "41463", "용인시 수지구": "41465", "용인시 처인구": "41461",
+        "의왕시": "41430", "의정부시": "41150", "이천시": "41500", "파주시": "41480",
+        "평택시": "41220", "포천시": "41650", "하남시": "41450", "화성시": "41590",
+    },
+    "인천광역시": {
+        "강화군": "28710", "계양구": "28245", "남동구": "28200", "동구": "28140",
+        "미추홀구": "28177", "부평구": "28237", "서구": "28260", "연수구": "28185",
+        "옹진군": "28720", "중구": "28110",
+    },
+    "부산광역시": {
+        "강서구": "26440", "금정구": "26410", "기장군": "26710", "남구": "26290",
+        "동구": "26170", "동래구": "26260", "부산진구": "26230", "북구": "26320",
+        "사상구": "26530", "사하구": "26380", "서구": "26140", "수영구": "26500",
+        "연제구": "26470", "영도구": "26200", "중구": "26110", "해운대구": "26350",
+    },
+    "대구광역시": {
+        "군위군": "27720", "남구": "27200", "달서구": "27290", "달성군": "27710",
+        "동구": "27140", "북구": "27230", "서구": "27170", "수성구": "27260", "중구": "27110",
+    },
+    "광주광역시": {
+        "광산구": "29200", "남구": "29155", "동구": "29110", "북구": "29170", "서구": "29140",
+    },
+    "대전광역시": {
+        "대덕구": "30230", "동구": "30110", "서구": "30170", "유성구": "30200", "중구": "30140",
+    },
+    "울산광역시": {
+        "남구": "31140", "동구": "31170", "북구": "31200", "울주군": "31710", "중구": "31110",
+    },
+    "세종특별자치시": {
+        "세종특별자치시": "36110",
+    },
+    "강원특별자치도": {
+        "강릉시": "51150", "고성군": "51820", "동해시": "51170", "삼척시": "51230",
+        "속초시": "51210", "양구군": "51800", "양양군": "51830", "영월군": "51750",
+        "원주시": "51130", "인제군": "51810", "정선군": "51770", "철원군": "51780",
+        "춘천시": "51110", "태백시": "51190", "평창군": "51760", "홍천군": "51720",
+        "화천군": "51790", "횡성군": "51730",
+    },
+    "충청북도": {
+        "괴산군": "43760", "단양군": "43800", "보은군": "43720", "영동군": "43740",
+        "옥천군": "43730", "음성군": "43770", "제천시": "43150", "증평군": "43745",
+        "진천군": "43750", "청주시 상당구": "43111", "청주시 서원구": "43112",
+        "청주시 청원구": "43114", "청주시 흥덕구": "43113", "충주시": "43130",
+    },
+    "충청남도": {
+        "계룡시": "44250", "공주시": "44150", "금산군": "44710", "논산시": "44230",
+        "당진시": "44270", "보령시": "44180", "부여군": "44760", "서산시": "44210",
+        "서천군": "44770", "아산시": "44200", "예산군": "44810",
+        "천안시 동남구": "44131", "천안시 서북구": "44133", "청양군": "44790",
+        "태안군": "44825", "홍성군": "44800",
+    },
+    "전북특별자치도": {
+        "고창군": "52790", "군산시": "52130", "김제시": "52210", "남원시": "52190",
+        "무주군": "52730", "부안군": "52800", "순창군": "52770", "완주군": "52710",
+        "익산시": "52140", "임실군": "52750", "장수군": "52740",
+        "전주시 덕진구": "52113", "전주시 완산구": "52111", "정읍시": "52180", "진안군": "52720",
+    },
+    "전라남도": {
+        "강진군": "46810", "고흥군": "46770", "곡성군": "46720", "광양시": "46230",
+        "구례군": "46730", "나주시": "46170", "담양군": "46710", "목포시": "46110",
+        "무안군": "46840", "보성군": "46780", "순천시": "46150", "신안군": "46910",
+        "여수시": "46130", "영광군": "46870", "영암군": "46830", "완도군": "46890",
+        "장성군": "46880", "장흥군": "46800", "진도군": "46900", "함평군": "46860",
+        "해남군": "46820", "화순군": "46790",
+    },
+    "경상북도": {
+        "경산시": "47290", "경주시": "47130", "고령군": "47830", "구미시": "47190",
+        "김천시": "47150", "문경시": "47280", "봉화군": "47920", "상주시": "47250",
+        "성주군": "47840", "안동시": "47170", "영덕군": "47770", "영양군": "47760",
+        "영주시": "47210", "영천시": "47230", "예천군": "47900", "울릉군": "47940",
+        "울진군": "47930", "의성군": "47730", "청도군": "47820", "청송군": "47750",
+        "칠곡군": "47850", "포항시 남구": "47111", "포항시 북구": "47113",
+    },
+    "경상남도": {
+        "거제시": "48310", "거창군": "48880", "고성군": "48820", "김해시": "48250",
+        "남해군": "48840", "밀양시": "48270", "사천시": "48240", "산청군": "48860",
+        "양산시": "48330", "의령군": "48720", "진주시": "48170", "창녕군": "48740",
+        "창원시 마산합포구": "48125", "창원시 마산회원구": "48127", "창원시 성산구": "48123",
+        "창원시 의창구": "48121", "창원시 진해구": "48129", "통영시": "48220",
+        "하동군": "48850", "함안군": "48730", "함양군": "48870", "합천군": "48890",
+    },
+    "제주특별자치도": {
+        "서귀포시": "50130", "제주시": "50110",
+    },
 }
 
 
 # =====================================================================
-# 1. 법정동 코드 조회 (행정표준코드 공개 API - 차단 없음)
-# =====================================================================
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_sigungu_list(sido_prefix):
-    """시/도 앞 2자리 코드로 하위 시/군/구 5자리 코드 목록 조회"""
-    if sido_prefix == "36":
-        return [{"name": "세종특별자치시", "code5": "36110"}]
-
-    url = f"https://grpc-proxy-server-mkvo6j4wsq-du.a.run.app/v1/regcodes?regcode_pattern={sido_prefix}*00000&is_ignore_zero=true"
-    try:
-        res = requests.get(url, timeout=8)
-        if res.status_code == 200:
-            items = res.json().get("regcodes", [])
-            result = []
-            for item in items:
-                full_name = item["name"]
-                parts = full_name.split(" ", 1)
-                sgg_name = parts[1] if len(parts) > 1 else full_name
-                result.append({"name": sgg_name, "code5": item["code"][:5]})
-            if result:
-                return result
-    except Exception:
-        pass
-    return [{"name": "이천시", "code5": "41500"}]
-
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_dong_list(code5):
-    """시/군/구 5자리 코드로 하위 읍/면/동 목록 조회"""
-    url = f"https://grpc-proxy-server-mkvo6j4wsq-du.a.run.app/v1/regcodes?regcode_pattern={code5}*&is_ignore_zero=true"
-    try:
-        res = requests.get(url, timeout=8)
-        if res.status_code == 200:
-            items = res.json().get("regcodes", [])
-            dongs = []
-            for item in items:
-                if item["code"].endswith("00000"):
-                    continue
-                parts = item["name"].split(" ")
-                dongs.append(parts[-1])
-            return sorted(list(set(dongs)))
-    except Exception:
-        pass
-    return []
-
-
-# =====================================================================
-# 2. 국토교통부 아파트 매매 / 전월세 실거래가 API 수집
+# 국토교통부 아파트 매매 / 전월세 실거래가 API 병렬 고속 수집
 # =====================================================================
 def fmt_price(val):
     if not val or val <= 0:
@@ -150,97 +189,116 @@ def get_xml_text(item_elem, tag_names):
     return ""
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def collect_molit_transactions(lawd_cd_5, service_key, months=24):
-    if not service_key or not lawd_cd_5:
-        return [], [], "인증키 또는 지역코드가 없습니다."
-
-    ym_list = get_recent_ym_list(months)
+def fetch_single_month_data(lawd_cd_5, service_key, ym):
+    """단일 연월(YYYYMM)의 매매 + 전월세 데이터를 동시에 조회"""
     sale_endpoints = [
         "https://apis.data.go.kr/1613000/RTMSDataSvcAptTradeDev/getRTMSDataSvcAptTradeDev",
         "https://apis.data.go.kr/1613000/RTMSDataSvcAptTrade/getRTMSDataSvcAptTrade",
     ]
     rent_ep = "https://apis.data.go.kr/1613000/RTMSDataSvcAptRent/getRTMSDataSvcAptRent"
 
-    sale_records, rent_records = [], []
-    active_sale_ep = sale_endpoints[0]
-    api_error_msg = ""
+    month_sales, month_rents = [], []
+    err_msg = ""
 
-    for idx, ym in enumerate(ym_list):
-        for ep in [active_sale_ep] + [e for e in sale_endpoints if e != active_sale_ep]:
-            try:
-                xml_str = fetch_molit_xml(ep, service_key, lawd_cd_5, ym)
-                root = ET.fromstring(xml_str)
-                res_code = get_xml_text(root, [".//resultCode"])
-                if res_code and res_code not in ["00", "000"]:
-                    if idx == 0:
-                        api_error_msg = f"API 응답 코드({res_code}): {get_xml_text(root, ['.//resultMsg'])}"
-                    continue
-                active_sale_ep = ep
-                for item in root.findall(".//item"):
-                    if get_xml_text(item, ["cdealType", "해제여부"]) == "O":
-                        continue
-                    dong_nm = get_xml_text(item, ["umdNm", "법정동"])
-                    apt_nm = get_xml_text(item, ["aptNm", "아파트"])
-                    price_str = get_xml_text(item, ["dealAmount", "거래금액"]).replace(",", "")
-                    if not price_str or not apt_nm:
-                        continue
-                    area_str = get_xml_text(item, ["excluUseAr", "전용면적"])
-                    floor_str = get_xml_text(item, ["floor", "층"])
-                    y_str = get_xml_text(item, ["dealYear", "년"])
-                    m_int = int(get_xml_text(item, ["dealMonth", "월"]) or 1)
-                    d_int = int(get_xml_text(item, ["dealDay", "일"]) or 1)
-                    b_yr = get_xml_text(item, ["buildYear", "건축년도"])
-
-                    sale_records.append({
-                        "dong": dong_nm,
-                        "apt_name": apt_nm,
-                        "price": int(price_str),
-                        "area": round(float(area_str), 2) if area_str else 0.0,
-                        "floor": int(floor_str) if floor_str.lstrip("-").isdigit() else 0,
-                        "date": f"{y_str}-{m_int:02d}-{d_int:02d}",
-                        "ym": f"{y_str}-{m_int:02d}",
-                        "build_year": int(b_yr) if b_yr.isdigit() else 0,
-                    })
-                break
-            except Exception as e:
-                if idx == 0:
-                    api_error_msg = str(e)
-                continue
-
+    # 1) 매매 조회
+    for ep in sale_endpoints:
         try:
-            xml_str = fetch_molit_xml(rent_ep, service_key, lawd_cd_5, ym)
+            xml_str = fetch_molit_xml(ep, service_key, lawd_cd_5, ym)
             root = ET.fromstring(xml_str)
             res_code = get_xml_text(root, [".//resultCode"])
-            if not res_code or res_code in ["00", "000"]:
-                for item in root.findall(".//item"):
-                    dong_nm = get_xml_text(item, ["umdNm", "법정동"])
-                    apt_nm = get_xml_text(item, ["aptNm", "아파트"])
-                    dep_str = get_xml_text(item, ["deposit", "보증금액"]).replace(",", "")
-                    mon_str = get_xml_text(item, ["monthlyRent", "월세금액"]).replace(",", "")
-                    if not dep_str or not apt_nm or (mon_str.isdigit() and int(mon_str) > 0):
-                        continue
-                    area_str = get_xml_text(item, ["excluUseAr", "전용면적"])
-                    floor_str = get_xml_text(item, ["floor", "층"])
-                    y_str = get_xml_text(item, ["dealYear", "년"])
-                    m_int = int(get_xml_text(item, ["dealMonth", "월"]) or 1)
-                    d_int = int(get_xml_text(item, ["dealDay", "일"]) or 1)
-                    b_yr = get_xml_text(item, ["buildYear", "건축년도"])
+            if res_code and res_code not in ["00", "000"]:
+                err_msg = f"API 응답 코드({res_code}): {get_xml_text(root, ['.//resultMsg'])}"
+                continue
+            for item in root.findall(".//item"):
+                if get_xml_text(item, ["cdealType", "해제여부"]) == "O":
+                    continue
+                dong_nm = get_xml_text(item, ["umdNm", "법정동"])
+                apt_nm = get_xml_text(item, ["aptNm", "아파트"])
+                price_str = get_xml_text(item, ["dealAmount", "거래금액"]).replace(",", "")
+                if not price_str or not apt_nm:
+                    continue
+                area_str = get_xml_text(item, ["excluUseAr", "전용면적"])
+                floor_str = get_xml_text(item, ["floor", "층"])
+                y_str = get_xml_text(item, ["dealYear", "년"])
+                m_int = int(get_xml_text(item, ["dealMonth", "월"]) or 1)
+                d_int = int(get_xml_text(item, ["dealDay", "일"]) or 1)
+                b_yr = get_xml_text(item, ["buildYear", "건축년도"])
 
-                    rent_records.append({
-                        "dong": dong_nm,
-                        "apt_name": apt_nm,
-                        "deposit": int(dep_str),
-                        "area": round(float(area_str), 2) if area_str else 0.0,
-                        "floor": int(floor_str) if floor_str.lstrip("-").isdigit() else 0,
-                        "date": f"{y_str}-{m_int:02d}-{d_int:02d}",
-                        "ym": f"{y_str}-{m_int:02d}",
-                        "build_year": int(b_yr) if b_yr.isdigit() else 0,
-                    })
-        except Exception:
-            pass
+                month_sales.append({
+                    "dong": dong_nm,
+                    "apt_name": apt_nm,
+                    "price": int(price_str),
+                    "area": round(float(area_str), 2) if area_str else 0.0,
+                    "floor": int(floor_str) if floor_str.lstrip("-").isdigit() else 0,
+                    "date": f"{y_str}-{m_int:02d}-{d_int:02d}",
+                    "ym": f"{y_str}-{m_int:02d}",
+                    "build_year": int(b_yr) if b_yr.isdigit() else 0,
+                })
+            break
+        except Exception as e:
+            err_msg = str(e)
+            continue
 
-    return sale_records, rent_records, api_error_msg
+    # 2) 전월세 조회 (순수 전세만 추출)
+    try:
+        xml_str = fetch_molit_xml(rent_ep, service_key, lawd_cd_5, ym)
+        root = ET.fromstring(xml_str)
+        res_code = get_xml_text(root, [".//resultCode"])
+        if not res_code or res_code in ["00", "000"]:
+            for item in root.findall(".//item"):
+                dong_nm = get_xml_text(item, ["umdNm", "법정동"])
+                apt_nm = get_xml_text(item, ["aptNm", "아파트"])
+                dep_str = get_xml_text(item, ["deposit", "보증금액"]).replace(",", "")
+                mon_str = get_xml_text(item, ["monthlyRent", "월세금액"]).replace(",", "")
+                if not dep_str or not apt_nm or (mon_str.isdigit() and int(mon_str) > 0):
+                    continue
+                area_str = get_xml_text(item, ["excluUseAr", "전용면적"])
+                floor_str = get_xml_text(item, ["floor", "층"])
+                y_str = get_xml_text(item, ["dealYear", "년"])
+                m_int = int(get_xml_text(item, ["dealMonth", "월"]) or 1)
+                d_int = int(get_xml_text(item, ["dealDay", "일"]) or 1)
+                b_yr = get_xml_text(item, ["buildYear", "건축년도"])
+
+                month_rents.append({
+                    "dong": dong_nm,
+                    "apt_name": apt_nm,
+                    "deposit": int(dep_str),
+                    "area": round(float(area_str), 2) if area_str else 0.0,
+                    "floor": int(floor_str) if floor_str.lstrip("-").isdigit() else 0,
+                    "date": f"{y_str}-{m_int:02d}-{d_int:02d}",
+                    "ym": f"{y_str}-{m_int:02d}",
+                    "build_year": int(b_yr) if b_yr.isdigit() else 0,
+                })
+    except Exception:
+        pass
+
+    return month_sales, month_rents, err_msg
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def collect_molit_transactions(lawd_cd_5, service_key, months=24):
+    """최대 120개월까지 병렬 스레드로 빠르게 조회"""
+    if not service_key or not lawd_cd_5:
+        return [], [], "인증키 또는 지역코드가 없습니다."
+
+    ym_list = get_recent_ym_list(months)
+    sale_records, rent_records = [], []
+    first_err = ""
+
+    # 최대 8개 동시 요청으로 120개월 조회 속도 대폭 단축
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {
+            executor.submit(fetch_single_month_data, lawd_cd_5, service_key, ym): ym
+            for ym in ym_list
+        }
+        for future in as_completed(futures):
+            m_sales, m_rents, err = future.result()
+            sale_records.extend(m_sales)
+            rent_records.extend(m_rents)
+            if err and not first_err:
+                first_err = err
+
+    return sale_records, rent_records, first_err
 
 
 def normalize_apt_name(name):
@@ -251,31 +309,37 @@ def normalize_apt_name(name):
 
 
 # =====================================================================
-# 3. Streamlit 웹 UI
+# Streamlit 웹 UI 렌더링
 # =====================================================================
 st.title("🏢 국토교통부 실거래가 & 네이버 호가 통합 대시보드")
-st.caption("국토부 매매·전세 실거래가 추세와 PC에서 수집한 네이버 매물 CSV를 실시간으로 비교·분석합니다.")
+st.caption("최대 120개월(10년) 국토부 실거래가 추세와 PC에서 수집한 네이버 매물 CSV를 실시간으로 비교·분석합니다.")
 
 with st.sidebar:
     st.header("📍 1. 분석 지역 선택")
-    sido_names = list(SIDO_CODE_MAP.keys())
+
+    # 1) 시/도 선택
+    sido_names = list(REGION_DATA.keys())
     default_sido_idx = sido_names.index("경기도")
     sel_sido_name = st.selectbox("시/도 선택", sido_names, index=default_sido_idx)
-    sido_prefix = SIDO_CODE_MAP[sel_sido_name]
 
-    sgg_list = fetch_sigungu_list(sido_prefix)
-    sgg_names = [x["name"] for x in sgg_list]
+    # 2) 시/군/구 선택 (내장 딕셔너리에서 즉시 로드)
+    sgg_dict = REGION_DATA[sel_sido_name]
+    sgg_names = list(sgg_dict.keys())
     default_sgg_idx = sgg_names.index("이천시") if "이천시" in sgg_names else 0
     sel_sgg_name = st.selectbox("시/군/구 선택", sgg_names, index=default_sgg_idx)
-    lawd_cd_5 = next(x["code5"] for x in sgg_list if x["name"] == sel_sgg_name)
-
-    dong_list = fetch_dong_list(lawd_cd_5)
-    sel_dong_name = st.selectbox("읍/면/동 필터 (선택사항)", ["전체"] + dong_list)
+    lawd_cd_5 = sgg_dict[sel_sgg_name]
 
     st.divider()
     st.header("🏛️ 2. 국토부 API 설정")
     api_key = st.text_input("공공데이터포털 인증키", value=DEFAULT_API_KEY, type="password")
-    months = st.slider("실거래가 조회 기간 (개월)", min_value=6, max_value=48, value=24, step=6)
+    months = st.slider(
+        "실거래가 조회 기간 (개월)",
+        min_value=6,
+        max_value=120,
+        value=24,
+        step=6,
+        help="최대 120개월(10년)까지 조회 가능합니다. 기간이 길면 5~10초 정도 소요됩니다.",
+    )
 
     st.divider()
     st.header("📂 3. 네이버 매물 CSV 연동 (선택)")
@@ -300,11 +364,11 @@ if uploaded_csv is not None:
 
 # 데이터 조회 실행
 if run_btn:
-    with st.spinner(f"🏛️ {sel_sido_name} {sel_sgg_name} 최근 {months}개월 국토부 실거래가 조회 중..."):
+    with st.spinner(f"🏛️ {sel_sido_name} {sel_sgg_name} 최근 {months}개월({months/12:.1f}년) 국토부 실거래가 조회 중..."):
         sales, rents, err_msg = collect_molit_transactions(lawd_cd_5, api_key, months)
         st.session_state["molit_result"] = {
             "region": f"{sel_sido_name} {sel_sgg_name}",
-            "dong_filter": sel_dong_name,
+            "months": months,
             "sales": sales,
             "rents": rents,
             "err": err_msg,
@@ -313,16 +377,27 @@ if run_btn:
 # 결과 표시
 if "molit_result" in st.session_state:
     res = st.session_state["molit_result"]
-    sales = res["sales"]
-    rents = res["rents"]
+    all_sales = res["sales"]
+    all_rents = res["rents"]
 
-    if sel_dong_name != "전체":
-        sales = [s for s in sales if sel_dong_name in s["dong"] or s["dong"] in sel_dong_name]
-        rents = [r for r in rents if sel_dong_name in r["dong"] or r["dong"] in sel_dong_name]
-
-    if not sales:
+    if not all_sales:
         st.warning(f"조회된 매매 실거래 데이터가 없습니다. {res['err']}")
     else:
+        st.subheader(f"📊 {res['region']} 최근 {res['months']}개월 실거래가 심층 분석")
+
+        # 수집된 데이터에서 실제 읍/면/동 목록 추출하여 즉시 필터링 가능하게 제공
+        available_dongs = sorted(list({s["dong"] for s in all_sales if s["dong"]}))
+        col_f1, col_f2 = st.columns([1, 2])
+        with col_f1:
+            sel_dong_name = st.selectbox("🏘️ 읍/면/동 선택", ["전체 법정동"] + available_dongs)
+
+        if sel_dong_name != "전체 법정동":
+            sales = [s for s in all_sales if s["dong"] == sel_dong_name]
+            rents = [r for r in all_rents if r["dong"] == sel_dong_name]
+        else:
+            sales = all_sales
+            rents = all_rents
+
         # 단지 목록 생성 (거래건수 많은 순)
         apt_counts = {}
         for s in sales:
@@ -332,8 +407,13 @@ if "molit_result" in st.session_state:
         sorted_apts = sorted(apt_counts.items(), key=lambda x: (-x[1], x[0][0], x[0][1]))
         apt_labels = [f"[{k[0]}] {k[1]} (매매 {cnt}건)" for k, cnt in sorted_apts]
 
-        st.subheader(f"📊 {res['region']} ({sel_dong_name}) 실거래가 심층 분석")
-        sel_apt_idx = st.selectbox("🏢 분석할 아파트를 선택하세요:", range(len(apt_labels)), format_func=lambda i: apt_labels[i])
+        with col_f2:
+            sel_apt_idx = st.selectbox(
+                "🏢 분석할 아파트 단지 선택:",
+                range(len(apt_labels)),
+                format_func=lambda i: apt_labels[i],
+            )
+
         target_dong, target_apt = sorted_apts[sel_apt_idx][0]
 
         apt_sales = sorted([s for s in sales if s["dong"] == target_dong and s["apt_name"] == target_apt], key=lambda x: x["date"])
@@ -342,7 +422,7 @@ if "molit_result" in st.session_state:
         # 전용면적 선택
         areas = sorted(list({round(s["area"]) for s in apt_sales if s["area"] > 0}))
         area_opts = ["전체 평형"] + [f"전용 {a}㎡ (약 {round(a * 0.3025 * 1.32)}평형)" for a in areas]
-        sel_area_txt = st.radio("전용면적 선택", area_opts, horizontal=True)
+        sel_area_txt = st.radio("📐 전용면적 선택", area_opts, horizontal=True)
 
         if sel_area_txt != "전체 평형":
             t_area = int(re.search(r"전용 (\d+)㎡", sel_area_txt).group(1))
@@ -378,7 +458,7 @@ if "molit_result" in st.session_state:
             else:
                 c2.metric("네이버 호가 비교", "CSV 미연동", "사이드바에 CSV 업로드 시 표시")
 
-            c3.metric("최고가(전고점) 대비 회복률", f"{rec_rate:.1f}%", f"최고가: {fmt_price(peak['price'])} ({peak['date']})")
+            c3.metric("조회기간 최고가(전고점) 대비 회복률", f"{rec_rate:.1f}%", f"최고가: {fmt_price(peak['price'])} ({peak['date']})")
 
             if apt_rents:
                 rent_avg = round(sum(r["deposit"] for r in apt_rents[-5:]) / len(apt_rents[-5:]))
@@ -395,7 +475,7 @@ if "molit_result" in st.session_state:
                 mode="lines+markers",
                 name="국토부 실거래가 (억)",
                 line=dict(color="#1c7ed6", width=2.5),
-                marker=dict(size=8),
+                marker=dict(size=7),
             ))
             if naver_min > 0:
                 fig.add_hline(y=round(naver_min / 10000, 2), line_dash="dash", line_color="red", annotation_text=f"네이버 최저호가 ({fmt_price(naver_min)})")
@@ -403,9 +483,9 @@ if "molit_result" in st.session_state:
                 fig.add_hline(y=round(naver_avg / 10000, 2), line_dash="dot", line_color="green", annotation_text=f"네이버 평균호가 ({fmt_price(naver_avg)})")
 
             fig.update_layout(
-                title=f"📈 [{target_dong}] {target_apt} 실거래 추세 차트 (단위: 억 원)",
+                title=f"📈 [{target_dong}] {target_apt} 실거래 추세 차트 ({res['months']}개월, 단위: 억 원)",
                 yaxis_title="거래금액 (억 원)",
-                height=380,
+                height=400,
                 margin=dict(l=20, r=20, t=50, b=20),
             )
             st.plotly_chart(fig, use_container_width=True)
@@ -421,6 +501,6 @@ if "molit_result" in st.session_state:
             st.download_button(
                 "📥 이 단지 실거래가 엑셀(CSV) 다운로드",
                 data=csv_data,
-                file_name=f"{target_dong}_{target_apt}_실거래가.csv",
+                file_name=f"{target_dong}_{target_apt}_{res['months']}개월_실거래가.csv",
                 mime="text/csv",
             )
