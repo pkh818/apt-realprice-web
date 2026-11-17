@@ -19,19 +19,6 @@ st.set_page_config(
     layout="wide",
 )
 
-# 모바일(스마트폰)에서 selectbox 터치 시 가상 키보드(천지인 자판) 원천 차단 CSS
-st.markdown(
-    """
-    <style>
-    /* selectbox 내부의 텍스트 검색용 input 태그 자체를 숨겨 모바일 키보드 호출 차단 */
-    div[data-baseweb="select"] input {
-        display: none !important;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
 DEFAULT_API_KEY = st.secrets.get(
     "MOLIT_API_KEY",
     "31a08f319d25f742296a53f8cf22e82830a5aae5efd82cd666d17b62e2f9e64b",
@@ -425,9 +412,9 @@ st.title("🏢 국토교통부 실거래가 & 네이버 호가 통합 대시보�
 st.caption("국토부 매매·전세 실거래가 추세 분석과 PC에서 수집한 네이버 부동산 매물 CSV 상세 필터링을 한 화면에서 제공합니다.")
 
 with st.sidebar:
-st.header("📍 1. 국토부 실거래 조회 지역")
+    st.header("📍 1. 국토부 실거래 조회 지역")
 
-    # 1) 시/도 선택 (버튼식 - 키보드 절대 안 올라옴)
+    # 1) 시/도 선택 (버튼식 - 모바일 키보드 절대 안 올라옴)
     sido_names = list(REGION_DATA.keys())
     with st.expander("1) 시/도 선택", expanded=True):
         sel_sido_name = st.radio(
@@ -438,7 +425,7 @@ st.header("📍 1. 국토부 실거래 조회 지역")
             label_visibility="collapsed",
         )
 
-    # 2) 시/군/구 선택 (버튼식 - 키보드 절대 안 올라옴)
+    # 2) 시/군/구 선택 (버튼식 - 모바일 키보드 절대 안 올라옴)
     sgg_dict = REGION_DATA[sel_sido_name]
     sgg_names = list(sgg_dict.keys())
     default_sgg_idx = sgg_names.index("이천시") if "이천시" in sgg_names else 0
@@ -464,7 +451,10 @@ st.header("📍 1. 국토부 실거래 조회 지역")
             label_visibility="collapsed",
         )
 
-    st.info(f"선택된 지역: **{sel_sido_name} {sel_sgg_name}**" + (f" **{sel_dong_sidebar}**" if sel_dong_sidebar != "선택 안함" else " (전체)"))
+    st.info(
+        f"선택된 지역: **{sel_sido_name} {sel_sgg_name}**"
+        + (f" **{sel_dong_sidebar}**" if sel_dong_sidebar != "선택 안함" else " (전체)")
+    )
 
     st.divider()
     st.header("🏛️ 2. 국토부 API 설정")
