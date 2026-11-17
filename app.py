@@ -1,4 +1,5 @@
 import re
+import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -6,7 +7,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import pandas as pd
-import requests
 import streamlit as st
 import plotly.graph_objects as go
 
@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 # 페이지 기본 설정
 # =====================================================================
 st.set_page_config(
-    page_title="국토부 실거래가 & 네이버 호가 통합 대시보드",
+    page_title="국토부 실거래가 & 네이버 매물 통합 대시보드",
     page_icon="🏢",
     layout="wide",
 )
@@ -134,12 +134,10 @@ REGION_DATA = {
 
 
 # =====================================================================
-# 시/군/구 코드(5자리)로 읍/면/동 목록 조회 (다중 소스 자동 폴백)
+# 시/군/구 코드(5자리)로 읍/면/동 목록 조회
 # =====================================================================
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_dongs_by_sigungu(sido_name, sgg_name, code5):
-    """시군구 5자리 코드 기준으로 하위 읍/면/동 목록을 안정적으로 조회"""
-    # 1순위: 행정표준코드 공개 JSON/API (한글 인코딩 오류 없는 순수 ASCII URL)
     try:
         url = f"https://grpc-proxy-server-mkvo6j4wsq-du.a.run.app/v1/regcodes?regcode_pattern={code5}*00&is_ignore_zero=true"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -158,7 +156,6 @@ def get_dongs_by_sigungu(sido_name, sgg_name, code5):
     except Exception:
         pass
 
-    # 2순위: 최근 3개월 국토부 매매 실거래 데이터에서 해당 시군구의 실제 법정동 즉시 추출
     try:
         now = datetime.now()
         y, m = now.year, now.month
@@ -192,7 +189,7 @@ def get_dongs_by_sigungu(sido_name, sgg_name, code5):
 
 
 # =====================================================================
-# 국토교통부 아파트 매매 / 전월세 실거래가 API 병렬 고속 수집
+# 유틸리티 및 국토부 실거래가 API 병렬 수집 (진행바 지원)
 # =====================================================================
 def fmt_price(val):
     if not val or val <= 0:
@@ -217,6 +214,29 @@ def parse_price_to_manwon(price_text):
         return int(main_part)
     except Exception:
         return 0
+
+
+def parse_pyrom_num(py_str):
+    try:
+        m = re.search(r"(\d+)", str(py_str))
+        return int(m.group(1)) if m else 0
+    except Exception:
+        return 0
+
+
+def parse_floor_category(floor_raw):
+    s = str(floor_raw).strip()
+    if not s or s == "nan":
+        return "중"
+    top_part = s.split("/")[0]
+    m_tot = re.search(r"/(\d+)층", s)
+    total_part = int(m_tot.group(1)) if m_tot else 99
+
+    if top_part == "저" or (top_part.isdigit() and int(top_part) <= 3):
+        return "저"
+    if top_part in ["고", "탑"] or (top_part.isdigit() and int(top_part) >= total_part - 1):
+        return "고"
+    return "중"
 
 
 def get_recent_ym_list(months=24):
@@ -249,7 +269,6 @@ def get_xml_text(item_elem, tag_names):
 
 
 def fetch_single_month_data(lawd_cd_5, service_key, ym):
-    """단일 연월(YYYYMM)의 매매 + 전월세 데이터를 동시에 조회"""
     sale_endpoints = [
         "https://apis.data.go.kr/1613000/RTMSDataSvcAptTradeDev/getRTMSDataSvcAptTradeDev",
         "https://apis.data.go.kr/1613000/RTMSDataSvcAptTrade/getRTMSDataSvcAptTrade",
@@ -259,7 +278,6 @@ def fetch_single_month_data(lawd_cd_5, service_key, ym):
     month_sales, month_rents = [], []
     err_msg = ""
 
-    # 1) 매매 조회
     for ep in sale_endpoints:
         try:
             xml_str = fetch_molit_xml(ep, service_key, lawd_cd_5, ym)
@@ -298,7 +316,6 @@ def fetch_single_month_data(lawd_cd_5, service_key, ym):
             err_msg = str(e)
             continue
 
-    # 2) 전월세 조회 (순수 전세만 추출)
     try:
         xml_str = fetch_molit_xml(rent_ep, service_key, lawd_cd_5, ym)
         root = ET.fromstring(xml_str)
@@ -334,15 +351,19 @@ def fetch_single_month_data(lawd_cd_5, service_key, ym):
     return month_sales, month_rents, err_msg
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def collect_molit_transactions(lawd_cd_5, service_key, months=24):
-    """최대 120개월까지 병렬 스레드로 빠르게 조회"""
+def collect_molit_with_progress(lawd_cd_5, service_key, months=24):
+    """진행바 및 남은 예상 시간(초)을 실시간 표시하며 병렬 수집"""
     if not service_key or not lawd_cd_5:
         return [], [], "인증키 또는 지역코드가 없습니다."
 
     ym_list = get_recent_ym_list(months)
+    total_tasks = len(ym_list)
     sale_records, rent_records = [], []
     first_err = ""
+
+    progress_bar = st.progress(0, text=f"⏳ 국토교통부 실거래가 조회 준비 중... (총 {total_tasks}개월 분량)")
+    start_time = time.time()
+    completed = 0
 
     with ThreadPoolExecutor(max_workers=8) as executor:
         futures = {
@@ -355,6 +376,24 @@ def collect_molit_transactions(lawd_cd_5, service_key, months=24):
             rent_records.extend(m_rents)
             if err and not first_err:
                 first_err = err
+
+            completed += 1
+            elapsed = time.time() - start_time
+            avg_per_item = elapsed / completed
+            remaining_sec = max(0.0, avg_per_item * (total_tasks - completed))
+            pct = int((completed / total_tasks) * 100)
+
+            progress_bar.progress(
+                pct,
+                text=(
+                    f"🏛️ 실거래가 수집 중: {completed}/{total_tasks}개월 ({pct}%) | "
+                    f"경과: {elapsed:.1f}초 · 예상 남은 시간: 약 {remaining_sec:.1f}초"
+                ),
+            )
+
+    progress_bar.progress(100, text=f"✅ 조회 완료! (총 {total_tasks}개월 데이터 수집 소요 시간: {time.time() - start_time:.1f}초)")
+    time.sleep(0.6)
+    progress_bar.empty()
 
     return sale_records, rent_records, first_err
 
@@ -370,24 +409,23 @@ def normalize_apt_name(name):
 # Streamlit 웹 UI 렌더링
 # =====================================================================
 st.title("🏢 국토교통부 실거래가 & 네이버 호가 통합 대시보드")
-st.caption("최대 120개월(10년) 국토부 실거래가 추세와 PC에서 수집한 네이버 매물 CSV를 실시간으로 비교·분석합니다.")
+st.caption("국토부 매매·전세 실거래가 추세 분석과 PC에서 수집한 네이버 부동산 매물 CSV 상세 필터링을 한 화면에서 제공합니다.")
+
+dong_map_cache = {}
 
 with st.sidebar:
-    st.header("📍 1. 분석 지역 선택")
+    st.header("📍 1. 국토부 실거래 조회 지역")
 
-    # 1) 시/도 선택
     sido_names = list(REGION_DATA.keys())
     default_sido_idx = sido_names.index("경기도")
     sel_sido_name = st.selectbox("1) 시/도 선택", sido_names, index=default_sido_idx)
 
-    # 2) 시/군/구 선택
     sgg_dict = REGION_DATA[sel_sido_name]
     sgg_names = list(sgg_dict.keys())
     default_sgg_idx = sgg_names.index("이천시") if "이천시" in sgg_names else 0
     sel_sgg_name = st.selectbox("2) 시/군/구 선택", sgg_names, index=default_sgg_idx)
     lawd_cd_5 = sgg_dict[sel_sgg_name]
 
-    # 3) 읍/면/동 선택 (자동 조회, 기본값 '선택 안함')
     dong_candidates = get_dongs_by_sigungu(sel_sido_name, sel_sgg_name, lawd_cd_5)
     dong_options = ["선택 안함"] + dong_candidates
     sel_dong_sidebar = st.selectbox("3) 읍/면/동 선택", dong_options, index=0)
@@ -401,167 +439,367 @@ with st.sidebar:
         max_value=120,
         value=24,
         step=6,
-        help="최대 120개월(10년)까지 조회 가능합니다. 기간이 길면 5~10초 정도 소요됩니다.",
+        help="최대 120개월(10년)까지 조회 가능합니다.",
     )
+
+    run_btn = st.button("🚀 국토부 실거래가 조회 실행", type="primary", use_container_width=True)
 
     st.divider()
-    st.header("📂 3. 네이버 매물 CSV 연동 (선택)")
+    st.header("📂 3. 네이버 매물 CSV 업로드")
     uploaded_csv = st.file_uploader(
-        "PC 수집기 결과 CSV 파일 업로드",
+        "PC 수집기 결과 CSV 파일 선택",
         type=["csv"],
-        help="PC에서 수집한 *_all_listings.csv 파일을 올리면 현재 호가와 실거래가 괴리율을 자동 비교합니다.",
+        help="PC 수집기에서 생성된 *_all_listings.csv 파일을 업로드하면 아래 [네이버 매물 분석] 탭과 [실거래 괴리율]에 자동 연동됩니다.",
     )
 
-    run_btn = st.button("🚀 실거래가 조회 및 분석 실행", type="primary", use_container_width=True)
-
-# 업로드된 CSV 파싱
-naver_df = None
+# 업로드된 CSV 전처리 및 세션 저장
 if uploaded_csv is not None:
     try:
-        naver_df = pd.read_csv(uploaded_csv)
-        if "가격" in naver_df.columns:
-            naver_df["price_num"] = naver_df["가격"].apply(parse_price_to_manwon)
-        st.sidebar.success(f"✅ 매물 CSV 로드 완료 ({len(naver_df)}건)")
-    except Exception as e:
-        st.sidebar.error(f"CSV 읽기 오류: {e}")
+        raw_df = pd.read_csv(uploaded_csv)
+        # 표준 컬럼 보정
+        if "가격" in raw_df.columns:
+            raw_df["price_num"] = raw_df["가격"].apply(parse_price_to_manwon)
+        else:
+            raw_df["price_num"] = 0
 
-# 데이터 조회 실행
+        if "환산평형" in raw_df.columns:
+            raw_df["pyrom_num"] = raw_df["환산평형"].apply(parse_pyrom_num)
+        else:
+            raw_df["pyrom_num"] = 0
+
+        if "층수" in raw_df.columns:
+            raw_df["floor_cat"] = raw_df["층수"].apply(parse_floor_category)
+        else:
+            raw_df["floor_cat"] = "중"
+
+        for col, default_val in [
+            ("법정동", "-"), ("아파트명", "-"), ("단지코드", ""), ("거래구분", "-"),
+            ("공급/전용면적", "-"), ("세대수", 0), ("준공년도", 0),
+            ("층수", "-"), ("향", "-"), ("매물특징", "-"), ("가격", "-"),
+            ("중개업소(부동산)", "-"), ("네이버부동산URL", ""),
+        ]:
+            if col not in raw_df.columns:
+                raw_df[col] = default_val
+
+        raw_df["세대수"] = pd.to_numeric(raw_df["세대수"], errors="coerce").fillna(0).astype(int)
+        raw_df["준공년도"] = pd.to_numeric(raw_df["준공년도"], errors="coerce").fillna(0).astype(int)
+
+        st.session_state["naver_df"] = raw_df
+        st.sidebar.success(f"✅ 네이버 매물 CSV 로드 완료 ({len(raw_df):,}건)")
+    except Exception as e:
+        st.sidebar.error(f"CSV 파일 읽기 오류: {e}")
+
+naver_df = st.session_state.get("naver_df", None)
+
+# 국토부 실거래가 조회 실행 (메인 영역에 진행바 표시)
 if run_btn:
     region_label = (
         f"{sel_sido_name} {sel_sgg_name}"
         if sel_dong_sidebar == "선택 안함"
         else f"{sel_sido_name} {sel_sgg_name} {sel_dong_sidebar}"
     )
-    with st.spinner(f"🏛️ {region_label} 최근 {months}개월({months/12:.1f}년) 국토부 실거래가 조회 중..."):
-        sales, rents, err_msg = collect_molit_transactions(lawd_cd_5, api_key, months)
-        st.session_state["molit_result"] = {
-            "region": region_label,
-            "selected_dong": sel_dong_sidebar,
-            "months": months,
-            "sales": sales,
-            "rents": rents,
-            "err": err_msg,
-        }
+    sales, rents, err_msg = collect_molit_with_progress(lawd_cd_5, api_key, months)
+    st.session_state["molit_result"] = {
+        "region": region_label,
+        "selected_dong": sel_dong_sidebar,
+        "months": months,
+        "sales": sales,
+        "rents": rents,
+        "err": err_msg,
+    }
 
-# 결과 표시
-if "molit_result" in st.session_state:
-    res = st.session_state["molit_result"]
-    all_sales = res["sales"]
-    all_rents = res["rents"]
-    chosen_dong = res["selected_dong"]
+# =====================================================================
+# 메인 화면 탭 구성: [1. 네이버 매물 분석 & 필터링] / [2. 국토부 실거래가 추세 분석]
+# =====================================================================
+tab_naver, tab_molit = st.tabs([
+    f"📋 네이버 부동산 매물 분석 ({len(naver_df):,}건)" if naver_df is not None else "📋 네이버 부동산 매물 분석 (CSV 업로드)",
+    "📈 국토부 실거래가 & 괴리율 심층 분석",
+])
 
-    if not all_sales:
-        st.warning(f"조회된 매매 실거래 데이터가 없습니다. {res['err']}")
+# ---------------------------------------------------------------------
+# TAB 1: 업로드된 네이버 부동산 매물 CSV 상세 분석 및 필터링
+# ---------------------------------------------------------------------
+with tab_naver:
+    if naver_df is None:
+        st.info(
+            "👈 왼쪽 사이드바 **[3. 네이버 매물 CSV 업로드]**에서 PC 수집기로 만든 `*_all_listings.csv` 파일을 올려주세요.\n\n"
+            "업로드 즉시 단지별 매물 수 요약, 거래구분/평형/향/준공년도/특징/가격대별 다중 필터링 및 국토부 실거래가 비교가 활성화됩니다."
+        )
     else:
-        if chosen_dong != "선택 안함":
-            sales = [s for s in all_sales if chosen_dong in s["dong"] or s["dong"] in chosen_dong]
-            rents = [r for r in all_rents if chosen_dong in r["dong"] or r["dong"] in chosen_dong]
+        st.subheader("📊 수집된 네이버 부동산 매물 요약")
+
+        # 상단 요약 KPI 카드
+        total_cnt = len(naver_df)
+        sale_df = naver_df[naver_df["거래구분"] == "매매"]
+        jeonse_df = naver_df[naver_df["거래구분"] == "전세"]
+        wolse_df = naver_df[naver_df["거래구분"] == "월세"]
+        unique_apts = naver_df["아파트명"].nunique()
+
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("전체 수집 매물", f"{total_cnt:,}건", f"총 {unique_apts}개 단지")
+        m2.metric("매매 매물", f"{len(sale_df):,}건", f"평균 {fmt_price(sale_df['price_num'].mean())}" if not sale_df.empty else "-")
+        m3.metric("전세 매물", f"{len(jeonse_df):,}건", f"평균 {fmt_price(jeonse_df['price_num'].mean())}" if not jeonse_df.empty else "-")
+        m4.metric("월세 매물", f"{len(wolse_df):,}건")
+        m5.metric("매매 최저가", fmt_price(sale_df["price_num"].min()) if not sale_df.empty else "-")
+
+        # 단지별 매물 현황 접이식 요약표
+        with st.expander("🏢 단지별 매물 건수 및 최저·평균 호가 요약표 보기", expanded=False):
+            summary_rows = []
+            for (d_nm, a_nm), grp in naver_df.groupby(["법정동", "아파트명"]):
+                s_grp = grp[grp["거래구분"] == "매매"]
+                j_grp = grp[grp["거래구분"] == "전세"]
+                summary_rows.append({
+                    "법정동": d_nm,
+                    "아파트명": a_nm,
+                    "세대수": int(grp["세대수"].max()),
+                    "준공년도": int(grp["준공년도"].max()),
+                    "전체매물": len(grp),
+                    "매매건수": len(s_grp),
+                    "매매최저가": fmt_price(s_grp["price_num"].min()) if not s_grp.empty else "-",
+                    "매매평균가": fmt_price(s_grp["price_num"].mean()) if not s_grp.empty else "-",
+                    "전세건수": len(j_grp),
+                    "전세최저가": fmt_price(j_grp["price_num"].min()) if not j_grp.empty else "-",
+                })
+            df_apt_sum = pd.DataFrame(summary_rows).sort_values(by=["전체매물", "매매건수"], ascending=False)
+            st.dataframe(df_apt_sum, use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.subheader("🔍 상세 매물 조건 검색 및 필터링")
+
+        # 필터 컨트롤 1행
+        fc1, fc2, fc3, fc4 = st.columns(4)
+        with fc1:
+            f_trade = st.selectbox("거래구분", ["전체", "매매", "전세", "월세"])
+        with fc2:
+            dong_list_csv = ["전체 법정동"] + sorted(list(naver_df["법정동"].dropna().unique()))
+            f_dong = st.selectbox("법정동 선택", dong_list_csv)
+        with fc3:
+            f_apt_kw = st.text_input("아파트명 검색", placeholder="예: 롯데캐슬, 자이...")
+        with fc4:
+            f_dir = st.selectbox("향 (방향)", ["전체 방향", "남향 계열 (남/남동/남서)", "남향", "남동향", "남서향", "동향", "서향"])
+
+        # 필터 컨트롤 2행
+        fc5, fc6, fc7, fc8 = st.columns(4)
+        with fc5:
+            f_feat_kw = st.text_input("매물 특징 검색", placeholder="예: 올수리, 조망, 급매, 역세권...")
+        with fc6:
+            f_py_range = st.slider("평형 범위 (평)", min_value=0, max_value=100, value=(0, 100))
+        with fc7:
+            f_price_range = st.slider("가격 범위 (억 원)", min_value=0.0, max_value=50.0, value=(0.0, 50.0), step=0.5)
+        with fc8:
+            f_floor_opt = st.selectbox("층수 필터", ["모두 포함", "저·고층 제외 (중층만)", "저층만", "고층만"])
+
+        # 필터 컨트롤 3행
+        fc9, fc10, fc11, fc12 = st.columns(4)
+        with fc9:
+            f_min_year = st.number_input("최소 준공년도", min_value=0, max_value=2030, value=0, step=1)
+        with fc10:
+            f_min_ho = st.number_input("최소 세대수", min_value=0, max_value=10000, value=0, step=100)
+        with fc11:
+            f_sort = st.selectbox("정렬 기준", ["아파트명순", "가격 낮은순 ↑", "가격 높은순 ↓", "평형 넓은순 ↓", "준공 최신순 ↓"])
+        with fc12:
+            st.write("")
+            st.write("")
+            only_has_url = st.checkbox("네이버 링크 있는 매물만", value=False)
+
+        # 필터링 적용
+        fdf = naver_df.copy()
+        if f_trade != "전체":
+            fdf = fdf[fdf["거래구분"] == f_trade]
+        if f_dong != "전체 법정동":
+            fdf = fdf[fdf["법정동"] == f_dong]
+        if f_apt_kw.strip():
+            fdf = fdf[fdf["아파트명"].str.contains(f_apt_kw.strip(), case=False, na=False)]
+        if f_dir == "남향 계열 (남/남동/남서)":
+            fdf = fdf[fdf["향"].isin(["남향", "남동향", "남서향"])]
+        elif f_dir != "전체 방향":
+            fdf = fdf[fdf["향"] == f_dir]
+        if f_feat_kw.strip():
+            fdf = fdf[fdf["매물특징"].str.contains(f_feat_kw.strip(), case=False, na=False)]
+
+        if f_py_range != (0, 100):
+            fdf = fdf[(fdf["pyrom_num"] == 0) | ((fdf["pyrom_num"] >= f_py_range[0]) & (fdf["pyrom_num"] <= f_py_range[1]))]
+        if f_price_range != (0.0, 50.0):
+            min_man = f_price_range[0] * 10000
+            max_man = f_price_range[1] * 10000
+            fdf = fdf[(fdf["price_num"] >= min_man) & (fdf["price_num"] <= max_man)]
+
+        if f_floor_opt == "저·고층 제외 (중층만)":
+            fdf = fdf[fdf["floor_cat"] == "중"]
+        elif f_floor_opt == "저층만":
+            fdf = fdf[fdf["floor_cat"] == "저"]
+        elif f_floor_opt == "고층만":
+            fdf = fdf[fdf["floor_cat"] == "고"]
+
+        if f_min_year > 0:
+            fdf = fdf[(fdf["준공년도"] == 0) | (fdf["준공년도"] >= f_min_year)]
+        if f_min_ho > 0:
+            fdf = fdf[(fdf["세대수"] == 0) | (fdf["세대수"] >= f_min_ho)]
+        if only_has_url:
+            fdf = fdf[fdf["네이버부동산URL"].astype(str).str.startswith("http")]
+
+        # 정렬 적용
+        if f_sort == "가격 낮은순 ↑":
+            fdf = fdf.sort_values(by="price_num", ascending=True)
+        elif f_sort == "가격 높은순 ↓":
+            fdf = fdf.sort_values(by="price_num", ascending=False)
+        elif f_sort == "평형 넓은순 ↓":
+            fdf = fdf.sort_values(by="pyrom_num", ascending=False)
+        elif f_sort == "준공 최신순 ↓":
+            fdf = fdf.sort_values(by="준공년도", ascending=False)
         else:
-            sales = all_sales
-            rents = all_rents
+            fdf = fdf.sort_values(by=["아파트명", "price_num"], ascending=[True, True])
 
-        st.subheader(f"📊 {res['region']} 최근 {res['months']}개월 실거래가 심층 분석")
+        st.markdown(f"**✅ 필터링 결과: 전체 {len(naver_df):,}건 중 `{len(fdf):,}건` 일치**")
 
-        if not sales:
-            st.info(f"'{chosen_dong}' 지역에 최근 {res['months']}개월간 등록된 아파트 매매 실거래가 없습니다.")
+        display_cols = [
+            "법정동", "아파트명", "거래구분", "공급/전용면적", "환산평형",
+            "세대수", "준공년도", "층수", "향", "가격", "매물특징", "중개업소(부동산)", "네이버부동산URL"
+        ]
+        st.dataframe(
+            fdf[display_cols],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "네이버부동산URL": st.column_config.LinkColumn("단지 링크", display_text="네이버 열기 ↗"),
+                "세대수": st.column_config.NumberColumn("세대수", format="%d세대"),
+                "준공년도": st.column_config.NumberColumn("준공", format="%d년"),
+            },
+        )
+
+        csv_filtered = fdf[display_cols].to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+        st.download_button(
+            label="📥 필터링된 네이버 매물 CSV 다운로드",
+            data=csv_filtered,
+            file_name="filtered_naver_listings.csv",
+            mime="text/csv",
+        )
+
+# ---------------------------------------------------------------------
+# TAB 2: 국토교통부 실거래가 & 네이버 호가 괴리율 심층 분석
+# ---------------------------------------------------------------------
+with tab_molit:
+    if "molit_result" not in st.session_state:
+        st.info("👈 왼쪽 사이드바에서 **[1. 분석 지역]**과 **[2. 조회 기간]**을 선택한 후 **[🚀 국토부 실거래가 조회 실행]** 버튼을 눌러주세요.")
+    else:
+        res = st.session_state["molit_result"]
+        all_sales = res["sales"]
+        all_rents = res["rents"]
+        chosen_dong = res["selected_dong"]
+
+        if not all_sales:
+            st.warning(f"조회된 매매 실거래 데이터가 없습니다. {res['err']}")
         else:
-            apt_counts = {}
-            for s in sales:
-                key = (s["dong"], s["apt_name"])
-                apt_counts[key] = apt_counts.get(key, 0) + 1
+            if chosen_dong != "선택 안함":
+                sales = [s for s in all_sales if chosen_dong in s["dong"] or s["dong"] in chosen_dong]
+                rents = [r for r in all_rents if chosen_dong in r["dong"] or r["dong"] in chosen_dong]
+            else:
+                sales = all_sales
+                rents = all_rents
 
-            sorted_apts = sorted(apt_counts.items(), key=lambda x: (-x[1], x[0][0], x[0][1]))
-            apt_labels = [f"[{k[0]}] {k[1]} (매매 {cnt}건)" for k, cnt in sorted_apts]
+            st.subheader(f"📊 {res['region']} 최근 {res['months']}개월 실거래가 심층 분석")
 
-            sel_apt_idx = st.selectbox(
-                "🏢 분석할 아파트 단지 선택:",
-                range(len(apt_labels)),
-                format_func=lambda i: apt_labels[i],
-            )
+            if not sales:
+                st.info(f"'{chosen_dong}' 지역에 최근 {res['months']}개월간 등록된 아파트 매매 실거래가 없습니다.")
+            else:
+                apt_counts = {}
+                for s in sales:
+                    key = (s["dong"], s["apt_name"])
+                    apt_counts[key] = apt_counts.get(key, 0) + 1
 
-            target_dong, target_apt = sorted_apts[sel_apt_idx][0]
+                sorted_apts = sorted(apt_counts.items(), key=lambda x: (-x[1], x[0][0], x[0][1]))
+                apt_labels = [f"[{k[0]}] {k[1]} (매매 {cnt}건)" for k, cnt in sorted_apts]
 
-            apt_sales = sorted([s for s in sales if s["dong"] == target_dong and s["apt_name"] == target_apt], key=lambda x: x["date"])
-            apt_rents = sorted([r for r in rents if r["dong"] == target_dong and r["apt_name"] == target_apt], key=lambda x: x["date"])
-
-            areas = sorted(list({round(s["area"]) for s in apt_sales if s["area"] > 0}))
-            area_opts = ["전체 평형"] + [f"전용 {a}㎡ (약 {round(a * 0.3025 * 1.32)}평형)" for a in areas]
-            sel_area_txt = st.radio("📐 전용면적 선택", area_opts, horizontal=True)
-
-            if sel_area_txt != "전체 평형":
-                t_area = int(re.search(r"전용 (\d+)㎡", sel_area_txt).group(1))
-                apt_sales = [s for s in apt_sales if round(s["area"]) == t_area]
-                apt_rents = [r for r in apt_rents if round(r["area"]) == t_area]
-
-            if apt_sales:
-                recent_3 = apt_sales[-3:]
-                recent_avg = round(sum(s["price"] for s in recent_3) / len(recent_3))
-                latest = apt_sales[-1]
-                peak = max(apt_sales, key=lambda x: x["price"])
-                rec_rate = (recent_avg / peak["price"]) * 100
-
-                naver_min, naver_avg = 0, 0
-                if naver_df is not None and "아파트명" in naver_df.columns:
-                    t_norm = normalize_apt_name(target_apt)
-                    matched_n = naver_df[
-                        (naver_df["거래구분"] == "매매")
-                        & (naver_df["아파트명"].apply(lambda x: t_norm in normalize_apt_name(x) or normalize_apt_name(x) in t_norm))
-                    ]
-                    if not matched_n.empty:
-                        naver_min = int(matched_n["price_num"].min())
-                        naver_avg = int(matched_n["price_num"].mean())
-
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("최근 실거래가 (직전 3건 평균)", fmt_price(recent_avg), f"최근: {latest['date']} / {fmt_price(latest['price'])} ({latest['floor']}층)")
-
-                if naver_min > 0:
-                    diff = naver_min - recent_avg
-                    diff_pct = (diff / recent_avg) * 100
-                    c2.metric("네이버 최저 호가 vs 실거래", f"{diff_pct:+.1f}%", f"최저호가 {fmt_price(naver_min)}")
-                else:
-                    c2.metric("네이버 호가 비교", "CSV 미연동", "사이드바에 CSV 업로드 시 표시")
-
-                c3.metric("조회기간 최고가(전고점) 대비 회복률", f"{rec_rate:.1f}%", f"최고가: {fmt_price(peak['price'])} ({peak['date']})")
-
-                if apt_rents:
-                    rent_avg = round(sum(r["deposit"] for r in apt_rents[-5:]) / len(apt_rents[-5:]))
-                    j_ratio = (rent_avg / recent_avg) * 100
-                    c4.metric("전세가율 (매매-전세 갭)", f"{j_ratio:.1f}%", f"전세평균 {fmt_price(rent_avg)} (갭 {fmt_price(recent_avg - rent_avg)})")
-                else:
-                    c4.metric("전세가율", "전세 거래 부족", "최근 순수 전세 실거래 없음")
-
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(
-                    x=[f"{s['date']} ({s['floor']}층)" for s in apt_sales],
-                    y=[round(s["price"] / 10000, 2) for s in apt_sales],
-                    mode="lines+markers",
-                    name="국토부 실거래가 (억)",
-                    line=dict(color="#1c7ed6", width=2.5),
-                    marker=dict(size=7),
-                ))
-                if naver_min > 0:
-                    fig.add_hline(y=round(naver_min / 10000, 2), line_dash="dash", line_color="red", annotation_text=f"네이버 최저호가 ({fmt_price(naver_min)})")
-                if naver_avg > 0 and naver_avg != naver_min:
-                    fig.add_hline(y=round(naver_avg / 10000, 2), line_dash="dot", line_color="green", annotation_text=f"네이버 평균호가 ({fmt_price(naver_avg)})")
-
-                fig.update_layout(
-                    title=f"📈 [{target_dong}] {target_apt} 실거래 추세 차트 ({res['months']}개월, 단위: 억 원)",
-                    yaxis_title="거래금액 (억 원)",
-                    height=400,
-                    margin=dict(l=20, r=20, t=50, b=20),
+                sel_apt_idx = st.selectbox(
+                    "🏢 분석할 아파트 단지 선택:",
+                    range(len(apt_labels)),
+                    format_func=lambda i: apt_labels[i],
                 )
-                st.plotly_chart(fig, use_container_width=True)
 
-                df_detail = pd.DataFrame(apt_sales[::-1])[["date", "area", "floor", "price"]]
-                df_detail["실거래가"] = df_detail["price"].apply(fmt_price)
-                df_show = df_detail[["date", "area", "floor", "실거래가"]]
-                df_show.columns = ["계약일", "전용면적(㎡)", "층수", "실거래가"]
-                st.dataframe(df_show, use_container_width=True, hide_index=True)
+                target_dong, target_apt = sorted_apts[sel_apt_idx][0]
 
-                csv_data = df_show.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-                st.download_button(
-                    "📥 이 단지 실거래가 엑셀(CSV) 다운로드",
-                    data=csv_data,
-                    file_name=f"{target_dong}_{target_apt}_{res['months']}개월_실거래가.csv",
-                    mime="text/csv",
-                )
+                apt_sales = sorted([s for s in sales if s["dong"] == target_dong and s["apt_name"] == target_apt], key=lambda x: x["date"])
+                apt_rents = sorted([r for r in rents if r["dong"] == target_dong and r["apt_name"] == target_apt], key=lambda x: x["date"])
+
+                areas = sorted(list({round(s["area"]) for s in apt_sales if s["area"] > 0}))
+                area_opts = ["전체 평형"] + [f"전용 {a}㎡ (약 {round(a * 0.3025 * 1.32)}평형)" for a in areas]
+                sel_area_txt = st.radio("📐 전용면적 선택", area_opts, horizontal=True)
+
+                if sel_area_txt != "전체 평형":
+                    t_area = int(re.search(r"전용 (\d+)㎡", sel_area_txt).group(1))
+                    apt_sales = [s for s in apt_sales if round(s["area"]) == t_area]
+                    apt_rents = [r for r in apt_rents if round(r["area"]) == t_area]
+
+                if apt_sales:
+                    recent_3 = apt_sales[-3:]
+                    recent_avg = round(sum(s["price"] for s in recent_3) / len(recent_3))
+                    latest = apt_sales[-1]
+                    peak = max(apt_sales, key=lambda x: x["price"])
+                    rec_rate = (recent_avg / peak["price"]) * 100
+
+                    naver_min, naver_avg, naver_cnt = 0, 0, 0
+                    if naver_df is not None and "아파트명" in naver_df.columns:
+                        t_norm = normalize_apt_name(target_apt)
+                        matched_n = naver_df[
+                            (naver_df["거래구분"] == "매매")
+                            & (naver_df["아파트명"].apply(lambda x: t_norm in normalize_apt_name(x) or normalize_apt_name(x) in t_norm))
+                        ]
+                        if not matched_n.empty:
+                            naver_cnt = len(matched_n)
+                            naver_min = int(matched_n["price_num"].min())
+                            naver_avg = int(matched_n["price_num"].mean())
+
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("최근 실거래가 (직전 3건 평균)", fmt_price(recent_avg), f"최근: {latest['date']} / {fmt_price(latest['price'])} ({latest['floor']}층)")
+
+                    if naver_min > 0:
+                        diff = naver_min - recent_avg
+                        diff_pct = (diff / recent_avg) * 100
+                        c2.metric(f"네이버 최저 호가 ({naver_cnt}건 중)", f"{diff_pct:+.1f}%", f"최저 {fmt_price(naver_min)} / 평균 {fmt_price(naver_avg)}")
+                    else:
+                        c2.metric("네이버 호가 비교", "매물 없음/미연동", "CSV 업로드 시 자동 비교")
+
+                    c3.metric("조회기간 최고가(전고점) 대비 회복률", f"{rec_rate:.1f}%", f"최고가: {fmt_price(peak['price'])} ({peak['date']})")
+
+                    if apt_rents:
+                        rent_avg = round(sum(r["deposit"] for r in apt_rents[-5:]) / len(apt_rents[-5:]))
+                        j_ratio = (rent_avg / recent_avg) * 100
+                        c4.metric("전세가율 (매매-전세 갭)", f"{j_ratio:.1f}%", f"전세평균 {fmt_price(rent_avg)} (갭 {fmt_price(recent_avg - rent_avg)})")
+                    else:
+                        c4.metric("전세가율", "전세 거래 부족", "최근 순수 전세 실거래 없음")
+
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(
+                        x=[f"{s['date']} ({s['floor']}층)" for s in apt_sales],
+                        y=[round(s["price"] / 10000, 2) for s in apt_sales],
+                        mode="lines+markers",
+                        name="국토부 실거래가 (억)",
+                        line=dict(color="#1c7ed6", width=2.5),
+                        marker=dict(size=7),
+                    ))
+                    if naver_min > 0:
+                        fig.add_hline(y=round(naver_min / 10000, 2), line_dash="dash", line_color="red", annotation_text=f"네이버 최저호가 ({fmt_price(naver_min)})")
+                    if naver_avg > 0 and naver_avg != naver_min:
+                        fig.add_hline(y=round(naver_avg / 10000, 2), line_dash="dot", line_color="green", annotation_text=f"네이버 평균호가 ({fmt_price(naver_avg)})")
+
+                    fig.update_layout(
+                        title=f"📈 [{target_dong}] {target_apt} 실거래 추세 차트 ({res['months']}개월, 단위: 억 원)",
+                        yaxis_title="거래금액 (억 원)",
+                        height=400,
+                        margin=dict(l=20, r=20, t=50, b=20),
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    df_detail = pd.DataFrame(apt_sales[::-1])[["date", "area", "floor", "price"]]
+                    df_detail["실거래가"] = df_detail["price"].apply(fmt_price)
+                    df_show = df_detail[["date", "area", "floor", "실거래가"]]
+                    df_show.columns = ["계약일", "전용면적(㎡)", "층수", "실거래가"]
+                    st.dataframe(df_show, use_container_width=True, hide_index=True)
+
+                    csv_data = df_show.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+                    st.download_button(
+                        "📥 이 단지 실거래가 엑셀(CSV) 다운로드",
+                        data=csv_data,
+                        file_name=f"{target_dong}_{target_apt}_{res['months']}개월_실거래가.csv",
+                        mime="text/csv",
+                    )
