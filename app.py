@@ -20,18 +20,26 @@ st.set_page_config(
 )
 
 # 모바일(스마트폰)에서 드롭다운(selectbox) 터치 시 가상 키보드 올라오는 현상 방지
-st.markdown(
-    """
-    <style>
-    div[data-baseweb="select"] input {
-        caret-color: transparent !important;
-        pointer-events: none !important;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+# 모바일(스마트폰)에서 드롭다운(selectbox) 터치 시 가상 키보드 완벽 차단
+import streamlit.components.v1 as components
 
+components.html(
+    """
+    <script>
+    const disableMobileKeyboard = () => {
+        const inputs = window.parent.document.querySelectorAll('div[data-baseweb="select"] input');
+        inputs.forEach(input => {
+            input.setAttribute('readonly', 'readonly');
+            input.setAttribute('inputmode', 'none');
+        });
+    };
+    disableMobileKeyboard();
+    const observer = new MutationObserver(disableMobileKeyboard);
+    observer.observe(window.parent.document.body, { childList: true, subtree: true });
+    </script>
+    """,
+    height=0,
+)
 DEFAULT_API_KEY = st.secrets.get(
     "MOLIT_API_KEY",
     "31a08f319d25f742296a53f8cf22e82830a5aae5efd82cd666d17b62e2f9e64b",
