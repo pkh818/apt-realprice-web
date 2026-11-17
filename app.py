@@ -19,6 +19,19 @@ st.set_page_config(
     layout="wide",
 )
 
+# 모바일(스마트폰)에서 드롭다운(selectbox) 터치 시 가상 키보드 올라오는 현상 방지
+st.markdown(
+    """
+    <style>
+    div[data-baseweb="select"] input {
+        caret-color: transparent !important;
+        pointer-events: none !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 DEFAULT_API_KEY = st.secrets.get(
     "MOLIT_API_KEY",
     "31a08f319d25f742296a53f8cf22e82830a5aae5efd82cd666d17b62e2f9e64b",
@@ -411,8 +424,6 @@ def normalize_apt_name(name):
 st.title("🏢 국토교통부 실거래가 & 네이버 호가 통합 대시보드")
 st.caption("국토부 매매·전세 실거래가 추세 분석과 PC에서 수집한 네이버 부동산 매물 CSV 상세 필터링을 한 화면에서 제공합니다.")
 
-dong_map_cache = {}
-
 with st.sidebar:
     st.header("📍 1. 국토부 실거래 조회 지역")
 
@@ -456,7 +467,6 @@ with st.sidebar:
 if uploaded_csv is not None:
     try:
         raw_df = pd.read_csv(uploaded_csv)
-        # 표준 컬럼 보정
         if "가격" in raw_df.columns:
             raw_df["price_num"] = raw_df["가격"].apply(parse_price_to_manwon)
         else:
@@ -509,7 +519,7 @@ if run_btn:
     }
 
 # =====================================================================
-# 메인 화면 탭 구성: [1. 네이버 매물 분석 & 필터링] / [2. 국토부 실거래가 추세 분석]
+# 메인 화면 탭 구성
 # =====================================================================
 tab_naver, tab_molit = st.tabs([
     f"📋 네이버 부동산 매물 분석 ({len(naver_df):,}건)" if naver_df is not None else "📋 네이버 부동산 매물 분석 (CSV 업로드)",
@@ -528,7 +538,6 @@ with tab_naver:
     else:
         st.subheader("📊 수집된 네이버 부동산 매물 요약")
 
-        # 상단 요약 KPI 카드
         total_cnt = len(naver_df)
         sale_df = naver_df[naver_df["거래구분"] == "매매"]
         jeonse_df = naver_df[naver_df["거래구분"] == "전세"]
@@ -542,7 +551,6 @@ with tab_naver:
         m4.metric("월세 매물", f"{len(wolse_df):,}건")
         m5.metric("매매 최저가", fmt_price(sale_df["price_num"].min()) if not sale_df.empty else "-")
 
-        # 단지별 매물 현황 접이식 요약표
         with st.expander("🏢 단지별 매물 건수 및 최저·평균 호가 요약표 보기", expanded=False):
             summary_rows = []
             for (d_nm, a_nm), grp in naver_df.groupby(["법정동", "아파트명"]):
@@ -566,7 +574,6 @@ with tab_naver:
         st.divider()
         st.subheader("🔍 상세 매물 조건 검색 및 필터링")
 
-        # 필터 컨트롤 1행
         fc1, fc2, fc3, fc4 = st.columns(4)
         with fc1:
             f_trade = st.selectbox("거래구분", ["전체", "매매", "전세", "월세"])
@@ -578,7 +585,6 @@ with tab_naver:
         with fc4:
             f_dir = st.selectbox("향 (방향)", ["전체 방향", "남향 계열 (남/남동/남서)", "남향", "남동향", "남서향", "동향", "서향"])
 
-        # 필터 컨트롤 2행
         fc5, fc6, fc7, fc8 = st.columns(4)
         with fc5:
             f_feat_kw = st.text_input("매물 특징 검색", placeholder="예: 올수리, 조망, 급매, 역세권...")
@@ -589,7 +595,6 @@ with tab_naver:
         with fc8:
             f_floor_opt = st.selectbox("층수 필터", ["모두 포함", "저·고층 제외 (중층만)", "저층만", "고층만"])
 
-        # 필터 컨트롤 3행
         fc9, fc10, fc11, fc12 = st.columns(4)
         with fc9:
             f_min_year = st.number_input("최소 준공년도", min_value=0, max_value=2030, value=0, step=1)
@@ -602,7 +607,6 @@ with tab_naver:
             st.write("")
             only_has_url = st.checkbox("네이버 링크 있는 매물만", value=False)
 
-        # 필터링 적용
         fdf = naver_df.copy()
         if f_trade != "전체":
             fdf = fdf[fdf["거래구분"] == f_trade]
@@ -638,7 +642,6 @@ with tab_naver:
         if only_has_url:
             fdf = fdf[fdf["네이버부동산URL"].astype(str).str.startswith("http")]
 
-        # 정렬 적용
         if f_sort == "가격 낮은순 ↑":
             fdf = fdf.sort_values(by="price_num", ascending=True)
         elif f_sort == "가격 높은순 ↓":
