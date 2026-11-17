@@ -425,21 +425,46 @@ st.title("🏢 국토교통부 실거래가 & 네이버 호가 통합 대시보�
 st.caption("국토부 매매·전세 실거래가 추세 분석과 PC에서 수집한 네이버 부동산 매물 CSV 상세 필터링을 한 화면에서 제공합니다.")
 
 with st.sidebar:
-    st.header("📍 1. 국토부 실거래 조회 지역")
+st.header("📍 1. 국토부 실거래 조회 지역")
 
+    # 1) 시/도 선택 (버튼식 - 키보드 절대 안 올라옴)
     sido_names = list(REGION_DATA.keys())
-    default_sido_idx = sido_names.index("경기도")
-    sel_sido_name = st.selectbox("1) 시/도 선택", sido_names, index=default_sido_idx)
+    with st.expander("1) 시/도 선택", expanded=True):
+        sel_sido_name = st.radio(
+            "시/도",
+            sido_names,
+            index=sido_names.index("경기도"),
+            horizontal=True,
+            label_visibility="collapsed",
+        )
 
+    # 2) 시/군/구 선택 (버튼식 - 키보드 절대 안 올라옴)
     sgg_dict = REGION_DATA[sel_sido_name]
     sgg_names = list(sgg_dict.keys())
     default_sgg_idx = sgg_names.index("이천시") if "이천시" in sgg_names else 0
-    sel_sgg_name = st.selectbox("2) 시/군/구 선택", sgg_names, index=default_sgg_idx)
+    with st.expander(f"2) 시/군/구 선택 ({sel_sido_name})", expanded=True):
+        sel_sgg_name = st.radio(
+            "시/군/구",
+            sgg_names,
+            index=default_sgg_idx,
+            horizontal=True,
+            label_visibility="collapsed",
+        )
     lawd_cd_5 = sgg_dict[sel_sgg_name]
 
+    # 3) 읍/면/동 선택 (버튼식 - 기본값 '선택 안함')
     dong_candidates = get_dongs_by_sigungu(sel_sido_name, sel_sgg_name, lawd_cd_5)
     dong_options = ["선택 안함"] + dong_candidates
-    sel_dong_sidebar = st.selectbox("3) 읍/면/동 선택", dong_options, index=0)
+    with st.expander(f"3) 읍/면/동 선택 ({sel_sgg_name})", expanded=False):
+        sel_dong_sidebar = st.radio(
+            "읍/면/동",
+            dong_options,
+            index=0,
+            horizontal=True,
+            label_visibility="collapsed",
+        )
+
+    st.info(f"선택된 지역: **{sel_sido_name} {sel_sgg_name}**" + (f" **{sel_dong_sidebar}**" if sel_dong_sidebar != "선택 안함" else " (전체)"))
 
     st.divider()
     st.header("🏛️ 2. 국토부 API 설정")
